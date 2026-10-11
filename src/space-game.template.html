@@ -1,0 +1,935 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Space Game</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+    cursor: crosshair;
+  }
+
+  /* ---- Instruction hints: one quiet line of text. ---- */
+  .hint {
+    position: fixed;
+    left: 50%;
+    top: 64%;
+    color: rgba(255, 255, 255, 0.8);
+    font: 300 15px/1.2 -apple-system, "Helvetica Neue", "Segoe UI", system-ui, sans-serif;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+    text-align: center;
+    pointer-events: none;      /* taps go straight through to the sky */
+    opacity: 0;
+    transform: translate(-50%, 8px);
+    transition: opacity 0.9s ease, transform 0.9s ease;
+  }
+  .hint.show {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+  .hint-action { margin-top: 10px; }
+</style>
+</head>
+<body>
+<canvas id="sky"></canvas>
+
+<div class="hint" id="hint-tap" aria-live="polite">
+  <div>Turn sound on</div>
+  <div class="hint-action">Tap to make stars</div>
+</div>
+<div class="hint" id="hint-pinch" aria-live="polite">Pinch to fly through the stars</div>
+<!-- Clair de Lune (Debussy), embedded so the game stays a single file. -->
+<audio id="music" loop preload="auto" src="data:audio/mpeg;base64,__CLAIR_DE_LUNE_MP3__"></audio>
+<script>
+(() => {
+  const canvas = document.getElementById('sky');
+  const ctx = canvas.getContext('2d');
+  const stars = [];
+  let w = 0, h = 0, dpr = 1;
+
+  const smoothstep = (a, b, x) => {
+    const t = Math.min(Math.max((x - a) / (b - a), 0), 1);
+    return t * t * (3 - 2 * t);
+  };
+  const easeOut = (t) => 1 - Math.pow(1 - t, 3);
+  const rand = (a, b) => a + Math.random() * (b - a);
+
+  // ---- Star colours, drawn from the color_inspiration palette. ----
+  // core = the flat dot (barely tinted), glow = the halo (a bit richer).
+  const STAR_TYPES = [
+    { weight: 0.30, core: '#ffffff', glow: [215, 222, 255] }, // white
+    { weight: 0.24, core: '#eef0ff', glow: [108, 127, 213] }, // periwinkle
+    { weight: 0.14, core: '#f1ecff', glow: [150, 135, 215] }, // lavender
+    { weight: 0.14, core: '#fff2ec', glow: [249, 175, 152] }, // peach
+    { weight: 0.10, core: '#ffecf0', glow: [223, 156, 158] }, // dusty pink
+    { weight: 0.08, core: '#e8eeff', glow: [60, 100, 200] }   // cobalt
+  ];
+
+  // One pre-rendered halo sprite per star type.
+  const HALO = 64;
+  for (const type of STAR_TYPES) {
+    const c = document.createElement('canvas');
+    c.width = c.height = HALO * 2;
+    const g = c.getContext('2d');
+    const [r, gr, b] = type.glow;
+    const grad = g.createRadialGradient(HALO, HALO, 0, HALO, HALO, HALO);
+    grad.addColorStop(0, `rgba(${r},${gr},${b},0.6)`);
+    grad.addColorStop(0.22, `rgba(${r},${gr},${b},0.14)`);
+    grad.addColorStop(1, `rgba(${r},${gr},${b},0)`);
+    g.fillStyle = grad;
+    g.fillRect(0, 0, HALO * 2, HALO * 2);
+    type.halo = c;
+    type.rgb = `rgb(${r},${gr},${b})`;
+  }
+
+  function pickType() {
+    let roll = Math.random();
+    for (const type of STAR_TYPES) {
+      if ((roll -= type.weight) <= 0) return type;
+    }
+    return STAR_TYPES[1];
+  }
+
+  // ---- Nebula colours from color_inspiration, chosen by a smooth noise ----
+  // field so nearby clusters share a hue. Ordered so neighbouring entries
+  // blend well: cobalt -> periwinkle -> mauve -> rose -> peach.
+  const NEBULA = [
+    [37, 80, 182],   // cobalt
+    [108, 127, 213], // periwinkle
+    [125, 109, 161], // mauve
+    [175, 88, 126],  // rose
+    [210, 101, 130], // coral pink
+    [249, 175, 152]  // peach
+  ];
+
+  const seed = Math.random() * 1000;
+  function hash(x, y) {
+    const s = Math.sin(x * 127.1 + y * 311.7 + seed) * 43758.5453;
+    return s - Math.floor(s);
+  }
+  function noise(x, y) {
+    const xi = Math.floor(x), yi = Math.floor(y);
+    const xf = x - xi, yf = y - yi;
+    const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+    const a = hash(xi, yi), b = hash(xi + 1, yi);
+    const c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+  }
+  function nebulaColor(px, py) {
+    const t = noise(px / 320, py / 320) * (NEBULA.length - 1);
+    const i = Math.min(Math.floor(t), NEBULA.length - 2), f = t - i;
+    const a = NEBULA[i], b = NEBULA[i + 1];
+    return a.map((v, k) => Math.round(v + (b[k] - v) * f));
+  }
+
+  // ---- Gas: computed by hand on a coarse grid (one cell = GAS_CELL px), ----
+  // then stretched to full size. Doing the maths ourselves keeps it
+  // perfectly smooth; stacking canvas gradients piles up their dither
+  // patterns into visible stripes. Redrawn every frame, since the clouds
+  // breathe and the background follows the music.
+  const GAS_CELL = 6;
+  const gasCanvas = document.createElement('canvas');
+  const gas = gasCanvas.getContext('2d');
+  let gasImage = null, gasR = null, gasG = null, gasB = null;
+
+  // ---- Background: a faint wash of the inspiration colours. ----
+  // A deep navy base with a few very large, very soft patches of colour
+  // that melt into each other. Laid out once per visit; it sits infinitely
+  // far away, so it doesn't move when you fly.
+  const BG_BASE = [4, 10, 39].map((v) => (v / 255) * 0.25);   // navy, dimmed
+  const BG_LEVEL = 0.1;                                       // patch strength
+  const bgPatches = (() => {
+    const colors = [...NEBULA, NEBULA[1], NEBULA[0]].sort(() => Math.random() - 0.5);
+    // Jittered 3x2 grid, so the patches cover the screen evenly.
+    return colors.slice(0, 6).map((c, i) => ({
+      x: ((i % 3) + 0.15 + Math.random() * 0.7) / 3,
+      y: (Math.floor(i / 3) + 0.15 + Math.random() * 0.7) / 2,
+      size: 0.28 + Math.random() * 0.2,
+      color: c.map((v) => v / 255)
+    }));
+  })();
+  let bgR = null, bgG = null, bgB = null, bgDither = null;
+
+  function buildBackground() {
+    const gw = gasCanvas.width, gh = gasCanvas.height, n = gw * gh;
+    bgR = new Float32Array(n); bgG = new Float32Array(n); bgB = new Float32Array(n);
+    // Half a colour step of fixed random noise, so the very dark gradients
+    // don't show contour lines. Far too small to see as texture.
+    bgDither = new Float32Array(n);
+    for (let i = 0; i < n; i++) bgDither[i] = Math.random() - 0.5;
+
+    const span = Math.max(w, h);
+    for (let y = 0; y < gh; y++) {
+      for (let x = 0; x < gw; x++) {
+        const i = y * gw + x;
+        const px = x * GAS_CELL, py = y * GAS_CELL;
+        let r = BG_BASE[0], g = BG_BASE[1], b = BG_BASE[2];
+        for (const p of bgPatches) {
+          const dx = (px - p.x * w) / (p.size * span), dy = (py - p.y * h) / (p.size * span);
+          const f = Math.exp(-2.2 * (dx * dx + dy * dy)) * BG_LEVEL;
+          r += p.color[0] * f; g += p.color[1] * f; b += p.color[2] * f;
+        }
+        bgR[i] = r; bgG[i] = g; bgB[i] = b;
+      }
+    }
+  }
+
+  const clusterRadius = () => Math.max(70, Math.min(140, Math.min(w, h) * 0.13));
+
+  // ---- 3D space. ----
+  // Every star sits at its own random distance in front of the camera.
+  // Tapping places a star exactly under your finger at that distance, so
+  // the sky looks flat until you pinch to fly forward (or back).
+  const NEAR = 0.04;                  // closer than this, a star has passed you
+  const focal = () => Math.max(w, h) * 0.6;
+  let cam = 0, camTarget = 0;         // camera position along the depth axis
+
+  // Screen position and scale of every star for the current camera.
+  // k = how much bigger the star looks now than when it was made.
+  function project() {
+    const F = focal();
+    for (const s of stars) {
+      const dist = s.Z - cam;
+      s.visible = dist > NEAR;
+      if (!s.visible) continue;
+      s.sx = w / 2 + s.X * F / dist;
+      s.sy = h / 2 + s.Y * F / dist;
+      s.k = s.d0 / dist;
+    }
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    w = window.innerWidth;
+    h = window.innerHeight;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    gasCanvas.width = Math.ceil(w / GAS_CELL) + 1;
+    gasCanvas.height = Math.ceil(h / GAS_CELL) + 1;
+    gasImage = gas.createImageData(gasCanvas.width, gasCanvas.height);
+    const n = gasCanvas.width * gasCanvas.height;
+    gasR = new Float32Array(n); gasG = new Float32Array(n); gasB = new Float32Array(n);
+    buildBackground();
+  }
+
+  // A star's cloud comes from its cluster, or from having gone supernova.
+  function updateGasTarget(s) {
+    s.gasTarget = Math.max(smoothstep(2.5, 8, s.neighbors), s.gasFloor);
+  }
+
+  // ambient: one of the faint, distant stars already there when the game
+  // opens. They don't count towards clusters, rings or hints.
+  function addStar(px, py, ambient = false) {
+    // Mostly small stars, with the occasional bright one.
+    const size = Math.pow(Math.random(), 2.6);
+    const d0 = ambient ? rand(3.5, 6) : rand(0.8, 6);   // distance when made
+    const F = focal();
+    const r = ambient ? rand(0.5, 1.3) : 0.7 + size * 3.6;
+    const star = {
+      X: (px - w / 2) * d0 / F,
+      Y: (py - h / 2) * d0 / F,
+      Z: cam + d0,
+      d0,
+      r,
+      rBase: r,
+      bright: ambient ? rand(0.3, 0.55) : 0.65 + size * 0.35,
+      type: pickType(),
+      phase: Math.random() * Math.PI * 2,
+      speed: 0.5 + Math.random() * 0.7,
+      born: performance.now(),
+      ambient,
+      neighbors: 0,
+      gas: 0,
+      gasTarget: 0,
+      gasFloor: 0,
+      cloudScale: 1,
+      cloudGain: 1,
+      color: nebulaColor(px, py),
+      growing: false,
+      nova: null,
+      // Two broad, gently oval puffs per star; overlapping puffs merge into
+      // one soft cloud. Each breathes on its own slow rhythm.
+      wisps: Array.from({ length: 2 }, () => ({
+        dx: (Math.random() - 0.5) * 0.6,
+        dy: (Math.random() - 0.5) * 0.6,
+        size: 0.9 + Math.random() * 0.5,
+        angle: Math.random() * Math.PI,
+        squash: 0.6 + Math.random() * 0.3,
+        strength: 0.7 + Math.random() * 0.3,
+        ph: Math.random() * 100
+      }))
+    };
+
+    if (!ambient) {
+      // Clusters are judged by how close stars look on screen when tapped,
+      // and that membership is kept from then on.
+      project();
+      const R2 = clusterRadius() ** 2;
+      for (const s of stars) {
+        if (!s.visible || s.ambient) continue;
+        const dx = s.sx - px, dy = s.sy - py;
+        if (dx * dx + dy * dy < R2) {
+          s.neighbors++;
+          updateGasTarget(s);
+          star.neighbors++;
+        }
+      }
+      updateGasTarget(star);
+    }
+    stars.push(star);
+    return star;
+  }
+
+  // ---- Music: Clair de Lune, embedded below as an MP3. ----
+  // Browsers only allow sound after the viewer interacts, unless they have
+  // allowed autoplay for this page. So try straight away, and otherwise
+  // start on the first tap, click or key press.
+  const music = document.getElementById('music');
+  const MUSIC_VOLUME = 0.7;
+  let musicStarted = false, musicGain = null;
+
+  // Once the music is routed through Web Audio (so we can listen to it),
+  // its loudness is set by a gain node instead of the element itself.
+  function setMusicLevel(v) {
+    if (musicGain) { music.volume = 1; musicGain.gain.value = v; }
+    else music.volume = v;
+  }
+  let musicLevel = 0;
+
+  function startMusic() {
+    if (musicStarted) return;
+    musicStarted = true;
+    setMusicLevel(0);
+    music.play().then(() => {
+      // Gentle fade in over about four seconds.
+      const t0 = performance.now();
+      const fade = () => {
+        const k = Math.min((performance.now() - t0) / 4000, 1);
+        musicLevel = MUSIC_VOLUME * k * k;
+        setMusicLevel(musicLevel);
+        if (k < 1) requestAnimationFrame(fade);
+      };
+      requestAnimationFrame(fade);
+    }).catch(() => { musicStarted = false; });
+  }
+
+  // ---- Web Audio: celesta notes, plus listening to the music. ----
+  let audio = null, celestaBus = null, analyser = null;
+  let freqData = null, timeData = null, binPitchClass = null;
+  let onsetAnalyser = null, onsetData = null, onsetPrev = null;
+  let onsetSplit = 0, onsetTop = 0, onsetBottom = 1;
+
+  function initAudio() {
+    if (audio) {
+      if (audio.state === 'suspended') audio.resume();
+      return;
+    }
+    audio = new (window.AudioContext || window.webkitAudioContext)();
+
+    // A small, soft room: a generated reverb tail mixed in underneath.
+    const len = Math.floor(audio.sampleRate * 2.5);
+    const ir = audio.createBuffer(2, len, audio.sampleRate);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = ir.getChannelData(ch);
+      for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3);
+    }
+    const reverb = audio.createConvolver();
+    reverb.buffer = ir;
+    const wet = audio.createGain();
+    wet.gain.value = 0.35;
+
+    celestaBus = audio.createGain();
+    celestaBus.gain.value = 0.2;
+    celestaBus.connect(audio.destination);
+    celestaBus.connect(reverb);
+    reverb.connect(wet);
+    wet.connect(audio.destination);
+
+    // Route the music through an analyser, so the notes can follow its
+    // harmony and the background can follow its loudness.
+    try {
+      const source = audio.createMediaElementSource(music);
+      analyser = audio.createAnalyser();
+      analyser.fftSize = 8192;
+      analyser.smoothingTimeConstant = 0.8;
+      musicGain = audio.createGain();
+      source.connect(analyser);
+      // A second, quick-reacting listener just for catching each new note.
+      onsetAnalyser = audio.createAnalyser();
+      onsetAnalyser.fftSize = 2048;
+      onsetAnalyser.smoothingTimeConstant = 0.15;
+      source.connect(onsetAnalyser);
+      onsetData = new Float32Array(onsetAnalyser.frequencyBinCount);
+      onsetPrev = new Float32Array(onsetAnalyser.frequencyBinCount);
+      const onsetBinHz = audio.sampleRate / onsetAnalyser.fftSize;
+      onsetSplit = Math.round(400 / onsetBinHz);      // low band below 400 Hz
+      onsetTop = Math.round(3000 / onsetBinHz);       // ignore above 3 kHz
+      onsetBottom = Math.max(1, Math.round(60 / onsetBinHz));
+      source.connect(musicGain);
+      musicGain.connect(audio.destination);
+      setMusicLevel(musicLevel);
+
+      freqData = new Float32Array(analyser.frequencyBinCount);
+      timeData = new Float32Array(analyser.fftSize);
+      // Which pitch class (C = 0 ... B = 11) each frequency bin belongs to,
+      // over the range where the piano's harmony lives.
+      binPitchClass = new Int8Array(analyser.frequencyBinCount).fill(-1);
+      const binHz = audio.sampleRate / analyser.fftSize;
+      for (let i = 1; i < binPitchClass.length; i++) {
+        const f = i * binHz;
+        if (f < 100 || f > 2000) continue;
+        const midi = Math.round(69 + 12 * Math.log2(f / 440));
+        binPitchClass[i] = ((midi % 12) + 12) % 12;
+      }
+    } catch (err) {
+      analyser = null;      // Notes fall back to the plain scale.
+    }
+  }
+
+  // ---- Choosing notes. ----
+  // Clair de Lune is in D-flat major. Notes always come from that key,
+  // weighted towards whichever of its notes the piano is playing right now,
+  // so each star tends to land on the current chord.
+  const KEY = [1, 3, 5, 6, 8, 10, 0];           // Db Eb F Gb Ab Bb C
+  const PENTATONIC = new Set([1, 3, 5, 8, 10]); // the never-clashing five
+
+  function currentChroma() {
+    if (!analyser || music.paused) return null;
+    analyser.getFloatFrequencyData(freqData);
+    const chroma = new Float32Array(12);
+    for (let i = 0; i < freqData.length; i++) {
+      const pc = binPitchClass[i];
+      if (pc >= 0) chroma[pc] += Math.pow(10, freqData[i] / 20);
+    }
+    const max = Math.max(...chroma);
+    if (!(max > 1e-4)) return null;              // silence, or no data yet
+    for (let i = 0; i < 12; i++) chroma[i] /= max;
+    return chroma;
+  }
+
+  let lastNote = -1;
+  function pickNote(low, high) {
+    const chroma = currentChroma();
+    const options = [];
+    for (let m = low; m <= high; m++) {
+      const pc = m % 12;
+      if (!KEY.includes(pc) || m === lastNote) continue;
+      const weight = chroma
+        ? 0.04 + chroma[pc] * chroma[pc]           // follow the harmony
+        : (PENTATONIC.has(pc) ? 1 : 0.15);         // no music: plain scale
+      options.push([m, weight]);
+    }
+    let roll = Math.random() * options.reduce((sum, o) => sum + o[1], 0);
+    for (const [m, weight] of options) {
+      if ((roll -= weight) <= 0) { lastNote = m; return m; }
+    }
+    lastNote = options[0][0];
+    return lastNote;
+  }
+
+  // A celesta is a struck metal bar: a pure fundamental that rings, a
+  // quieter octave, and a brief bright "ding" partial on the strike.
+  function strike(midi, pan, { when = 0, velocity = 0.9, ring = 1.1 } = {}) {
+    if (!audio) return;
+    const t = audio.currentTime + 0.005 + when;
+    const freq = 440 * Math.pow(2, (midi - 69) / 12);
+    const out = audio.createStereoPanner ? audio.createStereoPanner() : audio.createGain();
+    if (out.pan) out.pan.value = Math.max(-1, Math.min(1, pan));
+    out.connect(celestaBus);
+    // [frequency ratio, level, decay in seconds]
+    const partials = [[1, 1, ring], [2, 0.16, ring * 0.4], [4.07, 0.07, 0.1]];
+    for (const [ratio, level, decay] of partials) {
+      const osc = audio.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = freq * ratio;
+      const g = audio.createGain();
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(level * velocity, t + 0.004);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + decay);
+      osc.connect(g);
+      g.connect(out);
+      osc.start(t);
+      osc.stop(t + decay + 0.05);
+    }
+  }
+
+  const panFor = (px) => (px / w) * 1.2 - 0.6;
+
+  // An ordinary star: one bright note, Db5 to C7.
+  function playStarNote(px) {
+    strike(pickNote(73, 96), panFor(px), { velocity: 0.8 + Math.random() * 0.2 });
+  }
+
+  // A star grown by holding: a lower, longer note with a soft octave above,
+  // deeper and longer the bigger it grew.
+  function playBloomNote(px, amount) {
+    const note = pickNote(amount > 0.5 ? 61 : 66, 76);
+    const ring = 1.4 + amount * 2.2;
+    strike(note, panFor(px), { velocity: 1, ring });
+    strike(note + 12, panFor(px), { velocity: 0.35, ring: ring * 0.8, when: 0.01 });
+  }
+
+  // A supernova: a slow rising shimmer of four notes over a low bloom.
+  function playNovaShimmer(px) {
+    const pan = panFor(px);
+    strike(pickNote(61, 72), pan, { velocity: 0.8, ring: 3 });
+    const picks = [pickNote(73, 80), pickNote(80, 87), pickNote(85, 92), pickNote(90, 97)];
+    picks.sort((a, b) => a - b).forEach((m, i) => {
+      strike(m, pan + (i - 1.5) * 0.15, { when: 0.12 + i * 0.11, velocity: 0.55 - i * 0.07, ring: 2 });
+    });
+  }
+
+  // ---- Listening to the music's loudness, for the background. ----
+  let loudEnv = 0, loudPeak = 1e-3, bgGain = 1;
+  function updateLoudness() {
+    let target = 1;
+    if (analyser && !music.paused) {
+      analyser.getFloatTimeDomainData(timeData);
+      let sum = 0;
+      for (let i = 0; i < timeData.length; i += 4) sum += timeData[i] * timeData[i];
+      const rms = Math.sqrt(sum / (timeData.length / 4));
+      loudEnv += (rms - loudEnv) * 0.02;                  // about a second
+      loudPeak = Math.max(loudEnv, loudPeak * 0.9997);    // slowly forgetting peak
+      target = 0.7 + 0.65 * Math.min(loudEnv / loudPeak, 1);
+    }
+    bgGain += (target - bgGain) * 0.03;
+  }
+
+  // ---- The sky as a music player: stars pulse with each new note. ----
+  // Every frame, look for a sudden rise in the music's spectrum, which is
+  // a note being struck. Low notes pulse the bigger stars and high notes
+  // the smaller ones, and each pulse fades within about a third of a second.
+  const makeBand = () => ({ mean: 0, dev: 1e-3, pulse: 0, last: 0 });
+  const lowBand = makeBand(), highBand = makeBand();
+  let lastPulseTime = 0;
+
+  function detectOnset(band, flux, now) {
+    // A note is a rise well above this band's recent average.
+    const over = flux - (band.mean + 1.4 * band.dev);
+    if (over > 0 && now - band.last > 110) {
+      band.pulse = Math.max(band.pulse, Math.min(1, 0.35 + over / (3 * band.dev + 1e-6)));
+      band.last = now;
+    }
+    band.dev += (Math.abs(flux - band.mean) - band.dev) * 0.05;
+    band.mean += (flux - band.mean) * 0.05;
+  }
+
+  function updatePulse(now) {
+    const dt = Math.min((now - lastPulseTime) / 1000, 0.1);
+    lastPulseTime = now;
+    const decay = Math.exp(-dt / 0.3);
+    lowBand.pulse *= decay;
+    highBand.pulse *= decay;
+    if (!onsetAnalyser || music.paused) return;
+
+    onsetAnalyser.getFloatFrequencyData(onsetData);
+    let low = 0, high = 0;
+    for (let i = onsetBottom; i < onsetTop; i++) {
+      const mag = Math.pow(10, onsetData[i] / 20);
+      const rise = mag - onsetPrev[i];
+      onsetPrev[i] = mag;
+      if (rise > 0) {
+        if (i < onsetSplit) low += rise; else high += rise;
+      }
+    }
+    detectOnset(lowBand, low, now);
+    detectOnset(highBand, high, now);
+  }
+
+  // On phones the browser only counts the end of a touch as permission
+  // for sound, so unlock on pointerup and keydown as well.
+  function unlockSound() {
+    initAudio();
+    startMusic();
+  }
+  window.addEventListener('pointerup', unlockSound);
+  window.addEventListener('keydown', unlockSound);
+  startMusic();
+
+  // ---- Instruction hints. ----
+  // "Tap to make stars" shows on load and fades after a few stars. Once ten
+  // stars exist, the pinch hint appears until the viewer first flies.
+  const tapHint = document.getElementById('hint-tap');
+  const pinchHint = document.getElementById('hint-pinch');
+  const TAP_HINT_UNTIL = 3, PINCH_HINT_AT = 10;
+  let starsMade = 0, hasFlown = false;
+
+  // With a mouse and no touchscreen, word the hints for clicking and scrolling.
+  if (!matchMedia('(pointer: coarse)').matches) {
+    tapHint.querySelector('.hint-action').textContent = 'Click to make stars';
+    pinchHint.textContent = 'Pinch or scroll to fly';
+  }
+  setTimeout(() => {
+    if (starsMade < TAP_HINT_UNTIL) tapHint.classList.add('show');
+  }, 700);
+
+  // ---- Making stars: tap, hold to grow, and the rare supernova. ----
+  const NOVA_CHANCE = 1 / 30, NOVA_AFTER = 8;   // never among the first few
+  const HOLD_DELAY = 280, GROW_TIME = 2600, GROW_MAX = 3.4;
+  let held = null;                               // { star, start, px, id }
+
+  function makeStar(px, py) {
+    const star = addStar(px, py);
+    playStarNote(px);
+    starsMade++;
+    if (starsMade > NOVA_AFTER && Math.random() < NOVA_CHANCE) {
+      star.nova = { start: performance.now() + 900, played: false };
+    }
+    if (starsMade === TAP_HINT_UNTIL) tapHint.classList.remove('show');
+    if (starsMade === PINCH_HINT_AT && !hasFlown) {
+      setTimeout(() => { if (!hasFlown) pinchHint.classList.add('show'); }, 1200);
+    }
+    return star;
+  }
+
+  function startHold(star, px, id, start) {
+    star.nova = null;                // a held star grows instead
+    star.growing = true;
+    star.growStart = start;
+    held = { star, px, id };
+  }
+
+  function endHold(id) {
+    if (!held || held.id !== id) return;
+    const s = held.star;
+    held = null;
+    if (!s.growing) return;
+    s.growing = false;
+    const amount = Math.min((performance.now() - s.growStart) / GROW_TIME, 1);
+    if (amount > 0.05) playBloomNote(s.sx, amount);
+  }
+
+  // ---- Input: tap to make a star, hold to grow it, pinch to fly. ----
+  // Pinching apart by a factor of e (about 2.7x) flies this far forward.
+  const FLY_SPEED = 1.2;
+  const fly = (amount) => {
+    camTarget += amount * FLY_SPEED;
+    if (amount !== 0 && !hasFlown) {
+      hasFlown = true;
+      pinchHint.classList.remove('show');
+    }
+  };
+
+  // A mouse click makes a star at once. A touch makes a star when the
+  // finger lifts, or once it has been held still for a moment (and then
+  // grows it), so the first finger of a pinch doesn't leave a star behind.
+  const touches = new Map();
+  let tapCandidate = false, pinchDist = 0, holdTimer = 0;
+
+  const pinchSpread = () => {
+    const [a, b] = [...touches.values()];
+    return Math.hypot(a.x - b.x, a.y - b.y);
+  };
+
+  canvas.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    unlockSound();
+    if (e.pointerType === 'mouse') {
+      if (e.button !== 0) return;
+      const star = makeStar(e.clientX, e.clientY);
+      const id = e.pointerId, start = performance.now();
+      clearTimeout(holdTimer);
+      holdTimer = setTimeout(() => startHold(star, e.clientX, id, start), HOLD_DELAY);
+      held = { star, px: e.clientX, id, pending: true };
+      return;
+    }
+    // A fresh first finger means any fingers we still remember were lost
+    // (lifted outside the window, say), so forget them.
+    if (e.isPrimary) touches.clear();
+    touches.set(e.pointerId, { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY });
+    clearTimeout(holdTimer);
+    if (touches.size === 1) {
+      tapCandidate = true;
+      const id = e.pointerId;
+      holdTimer = setTimeout(() => {
+        const p = touches.get(id);
+        if (!tapCandidate || !p || touches.size !== 1) return;
+        tapCandidate = false;            // lifting won't make a second star
+        startHold(makeStar(p.x, p.y), p.x, id, performance.now());
+      }, HOLD_DELAY);
+    } else {
+      tapCandidate = false;
+      if (held) endHold(held.id);        // a second finger: stop growing, fly
+      pinchDist = pinchSpread();
+    }
+  });
+
+  window.addEventListener('pointermove', (e) => {
+    const p = touches.get(e.pointerId);
+    if (!p) return;
+    p.x = e.clientX; p.y = e.clientY;
+    if (Math.hypot(p.x - p.x0, p.y - p.y0) > 12) tapCandidate = false;
+    if (touches.size >= 2) {
+      const d = pinchSpread();
+      if (pinchDist > 0 && d > 0) fly(Math.log(d / pinchDist));
+      pinchDist = d;
+    }
+  });
+
+  function endPointer(e) {
+    if (e.pointerType === 'mouse') {
+      clearTimeout(holdTimer);
+      if (held && held.pending) held = null;    // released before it grew
+      endHold(e.pointerId);
+      return;
+    }
+    const p = touches.get(e.pointerId);
+    if (!p) return;
+    touches.delete(e.pointerId);
+    clearTimeout(holdTimer);
+    endHold(e.pointerId);
+    if (e.type === 'pointerup' && tapCandidate && touches.size === 0) makeStar(p.x, p.y);
+    if (touches.size >= 2) pinchDist = pinchSpread();
+    if (touches.size === 0) tapCandidate = false;
+  }
+  window.addEventListener('pointerup', endPointer);
+  window.addEventListener('pointercancel', endPointer);
+
+  // Trackpad pinch arrives as ctrl + wheel in most browsers; a plain
+  // mouse wheel flies too, a little more gently per notch.
+  window.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const dy = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? h : 1);
+    fly(-dy * (e.ctrlKey ? 0.01 : 0.0025));
+  }, { passive: false });
+
+  // Safari on Mac reports trackpad pinches as gesture events instead.
+  let gestureScale = 1;
+  window.addEventListener('gesturestart', (e) => { e.preventDefault(); gestureScale = 1; });
+  window.addEventListener('gesturechange', (e) => {
+    e.preventDefault();
+    fly(Math.log(e.scale / gestureScale));
+    gestureScale = e.scale;
+  });
+  window.addEventListener('gestureend', (e) => e.preventDefault());
+
+  // ---- Drawing the gas layer: background, clouds and fly-through. ----
+
+  // Adds one soft, rotated, oval bell shape of colour to the gas grids.
+  function splat(cx, cy, rc, squash, angle, a, cr, cg, cb) {
+    const gw = gasCanvas.width, gh = gasCanvas.height;
+    const cos = Math.cos(angle), sin = Math.sin(angle);
+    const x0 = Math.max(0, Math.floor(cx - rc)), x1 = Math.min(gw - 1, Math.ceil(cx + rc));
+    const y0 = Math.max(0, Math.floor(cy - rc)), y1 = Math.min(gh - 1, Math.ceil(cy + rc));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const dx = x - cx, dy = y - cy;
+        const u = (dx * cos + dy * sin) / rc;
+        const v = (dy * cos - dx * sin) / (rc * squash);
+        const d2 = u * u + v * v;
+        if (d2 >= 1) continue;
+        // Bell-shaped falloff that reaches exactly zero at the edge.
+        const f = (1 - d2) * (1 - d2) * (1 - d2) * a;
+        const i = y * gw + x;
+        gasR[i] += cr * f; gasG[i] += cg * f; gasB[i] += cb * f;
+      }
+    }
+  }
+
+  function drawGas(t) {
+    const R = clusterRadius();
+    const n = gasR.length;
+
+    // The background wash, breathing with the music.
+    for (let i = 0; i < n; i++) {
+      gasR[i] = bgR[i] * bgGain; gasG[i] = bgG[i] * bgGain; gasB[i] = bgB[i] * bgGain;
+    }
+
+    let tintR = 0, tintG = 0, tintB = 0;
+    for (const s of stars) {
+      if (s.gas < 0.01 || !s.visible) continue;
+      const cr = s.color[0] / 255, cg = s.color[1] / 255, cb = s.color[2] / 255;
+
+      // Flying through: as a cloud reaches you it stops being a shape and
+      // becomes a soft tint over the whole view, which clears once passed.
+      const inside = s.gas * smoothstep(2, 4.5, s.k) * (1 - smoothstep(14, 30, s.k));
+      tintR += cr * inside; tintG += cg * inside; tintB += cb * inside;
+
+      // Clouds grow with perspective like the stars, but get more diffuse
+      // as they grow (so a near cloud doesn't flood the view), and thin
+      // away entirely as you fly into them.
+      const near = (1 - smoothstep(2, 4.5, s.k)) / (1 + 0.6 * Math.max(0, s.k - 1));
+      if (near <= 0) continue;
+      const scale = R * s.k * s.cloudScale;
+      for (const p of s.wisps) {
+        // Breathing: each puff slowly sways, swells and brightens on its
+        // own long rhythm (tens of seconds per cycle).
+        const sway = Math.sin(t * 0.07 + p.ph);
+        const swell = Math.sin(t * 0.05 + p.ph * 1.7);
+        const glow = Math.sin(t * 0.09 + p.ph * 2.3);
+        const rad = p.size * 1.3 * (1 + 0.08 * swell) * scale;
+        const a = s.gas * p.strength * 0.065 * near * (1 + 0.15 * glow) * s.cloudGain;
+        const cx = (s.sx + (p.dx + 0.05 * sway) * scale) / GAS_CELL;
+        const cy = (s.sy + (p.dy + 0.05 * swell) * scale) / GAS_CELL;
+        splat(cx, cy, rad / GAS_CELL, p.squash, p.angle + 0.12 * sway, a, cr, cg, cb);
+      }
+    }
+
+    // The fly-through tint, capped so it stays a soft wash of colour.
+    const tintAmount = Math.hypot(tintR, tintG, tintB);
+    const tintScale = 0.04 * Math.min(1, 2.5 / Math.max(tintAmount, 1e-6));
+    tintR *= tintScale; tintG *= tintScale; tintB *= tintScale;
+
+    // Soft tone curve so dense overlaps glow instead of clipping.
+    const data = gasImage.data;
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      data[j] = 255 * (1 - Math.exp(-(gasR[i] + tintR))) + bgDither[i];
+      data[j + 1] = 255 * (1 - Math.exp(-(gasG[i] + tintG))) + bgDither[i];
+      data[j + 2] = 255 * (1 - Math.exp(-(gasB[i] + tintB))) + bgDither[i];
+      data[j + 3] = 255;
+    }
+    gas.putImageData(gasImage, 0, 0);
+  }
+
+  // ---- The opening moment: a few faint, distant stars fade in. ----
+  function seedSky() {
+    const count = Math.round(14 + (w * h) / 60000);
+    const now = performance.now();
+    for (let i = 0; i < count; i++) {
+      const s = addStar(Math.random() * w, Math.random() * h, true);
+      s.born = now + 400 + Math.random() * 3500;   // a slow, staggered fade in
+    }
+  }
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const t = now / 1000;
+
+    // Glide the camera toward where the pinch has taken it. The glide is
+    // short, so movement stops almost as soon as the pinch does.
+    const camDiff = camTarget - cam;
+    if (Math.abs(camDiff) > 1e-4) cam += camDiff * 0.3;
+    else cam = camTarget;
+    project();
+
+    for (const s of stars) {
+      // Let the gas fade in gradually as clusters form.
+      s.gas += (s.gasTarget - s.gas) * 0.02;
+
+      // A held star swells towards a bigger, brighter size.
+      if (s.growing) {
+        const g = easeOut(Math.min((now - s.growStart) / GROW_TIME, 1));
+        s.r = s.rBase * (1 + (GROW_MAX - 1) * g);
+        s.bright = Math.min(1, s.bright + 0.004);
+      }
+
+      // A supernova begins: a shimmer of notes, and the star leaves a
+      // small nebula of its own behind.
+      if (s.nova && !s.nova.played && now >= s.nova.start) {
+        s.nova.played = true;
+        playNovaShimmer(s.sx);
+        // One star's cloud is much fainter than a cluster's, so a nova's
+        // own nebula is made larger and richer to hold its own.
+        s.gasFloor = 0.9;
+        s.cloudScale = 1.4;
+        s.cloudGain = 3;
+        s.color = s.color.map((v, k) => Math.round((v + s.type.glow[k]) / 2));
+        updateGasTarget(s);
+        s.r = s.rBase * 1.5;
+        s.bright = 1;
+      }
+    }
+
+    updateLoudness();
+    updatePulse(now);
+    drawGas(t);
+
+    // Far stars first, so nearer ones draw on top as they fly past.
+    const order = stars.filter((s) => s.visible).sort((a, b) => b.Z - a.Z);
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.globalAlpha = 1;
+    // The gas buffer is opaque, so it is also the background.
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(gasCanvas, 0, 0, gasCanvas.width * GAS_CELL, gasCanvas.height * GAS_CELL);
+
+    for (const s of order) {
+      // Clamp so the radius never goes negative (arc() throws on that);
+      // ambient stars fade in more slowly.
+      const age = Math.min(Math.max((now - s.born) / (s.ambient ? 2500 : 700), 0), 1);
+      if (age <= 0) continue;
+      const grow = easeOut(age);
+      const x = s.sx, y = s.sy;
+      if (x < -300 || x > w + 300 || y < -300 || y > h + 300) continue;
+
+      // Perspective: stars swell as you approach and fade just before they
+      // pass you; distant ones (after flying back) shrink and dim.
+      const r = Math.max(s.r * s.k, 0.4);
+      const fade = (1 - smoothstep(6, 14, s.k)) * Math.min(1, s.k * 2);
+      if (fade <= 0) continue;
+
+      // Supernova bloom: a bright flash of glow and two soft rings of the
+      // star's colour spreading out, over about four seconds.
+      if (s.nova && s.nova.played) {
+        const p = (now - s.nova.start) / 4000;
+        if (p < 1) {
+          const e = easeOut(p);
+          const flash = r * (6 + 40 * e);
+          ctx.globalAlpha = (1 - p) * 0.9 * fade;
+          ctx.drawImage(s.type.halo, x - flash, y - flash, flash * 2, flash * 2);
+          ctx.strokeStyle = s.type.rgb;
+          for (const [lag, width, alpha] of [[0, 1.5, 0.55], [0.12, 6, 0.12]]) {
+            const q = Math.max(0, p - lag);
+            ctx.globalAlpha = (1 - easeOut(Math.min(q / (1 - lag), 1))) * alpha * fade;
+            ctx.lineWidth = width;
+            ctx.beginPath();
+            ctx.arc(x, y, r + easeOut(q) * 170 * s.k, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+        }
+      }
+
+      // Gentle breathing glow, which also swells a little with each note
+      // in the music: bigger stars answer low notes, smaller ones high.
+      const breathe = 0.5 + 0.5 * Math.sin(t * s.speed + s.phase);
+      const lowShare = smoothstep(1.4, 3, s.rBase);
+      const beat = lowShare * lowBand.pulse + (1 - lowShare) * highBand.pulse;
+      const haloR = r * (5 + breathe * 2.5) * grow * (1 + 0.22 * beat);
+      ctx.globalAlpha = Math.min(1, (0.3 + breathe * 0.35 + 0.25 * beat) * s.bright * grow * fade);
+      ctx.drawImage(s.type.halo, x - haloR, y - haloR, haloR * 2, haloR * 2);
+
+      // Birth ring: a single thin ripple that fades out.
+      if (age < 1 && !s.ambient) {
+        ctx.globalAlpha = (1 - grow) * 0.45;
+        ctx.strokeStyle = s.type.core;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(x, y, r + grow * 18, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      // Flat core.
+      ctx.globalAlpha = s.bright * grow * fade;
+      ctx.fillStyle = s.type.core;
+      ctx.beginPath();
+      ctx.arc(x, y, r * grow, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  window.addEventListener('resize', resize);
+  resize();
+  seedSky();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
