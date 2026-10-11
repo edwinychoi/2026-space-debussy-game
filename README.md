@@ -1,6 +1,7 @@
 # 2026 Space Debussy Game
 
 A small, soothing game in a single HTML file. Tap the dark sky to make stars while Debussy's *Clair de Lune* plays.
+https://edwinychoi.github.io/2026-space-debussy-game/space-game.html
 
 ## Play
 
